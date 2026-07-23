@@ -21,6 +21,49 @@ banner() {
 vpn_active() { route -n get default 2>/dev/null | grep -qE 'interface: utun'; }
 vpn_iface()  { route -n get default 2>/dev/null | awk '/interface:/ {print $2}'; }
 
+# ── Interactive main menu ────────────────────────────────────
+interactive_menu() {
+    while true; do
+        clear
+        # Quick posture line
+        local vpn shield eco
+        if vpn_active; then vpn="${GREEN}VPN on${NC}"; else vpn="${RED}VPN off${NC}"; fi
+        [[ -f "$HOME/.wifi-shield.state" ]] && shield="${GREEN}Shield on${NC}" || shield="${DIM}Shield off${NC}"
+        [[ -f "$HOME/.battery-save.state" ]] && eco="${GREEN}Eco on${NC}" || eco="${DIM}Eco off${NC}"
+
+        echo ""
+        echo "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
+        echo "${BOLD}${CYAN}║${NC}  ${BOLD}🌍 field-mode — travel toolkit${NC}      ${BOLD}${CYAN}║${NC}"
+        echo "${BOLD}${CYAN}╚══════════════════════════════════════╝${NC}"
+        printf "   %b   •   %b   •   %b\n" "$vpn" "$shield" "$eco"
+        echo ""
+        echo "  ${BOLD}[ 1 ]${NC}  Field ON      — arm battery eco + WiFi ghost"
+        echo "  ${BOLD}[ 2 ]${NC}  Field OFF     — restore normal"
+        echo "  ${BOLD}[ 3 ]${NC}  Status        — full posture (battery + shield)"
+        echo "  ${BOLD}[ 4 ]${NC}  Log           — blocked inbound attempts"
+        echo "  ${BOLD}[ 5 ]${NC}  Security check — FileVault / firewall / VPN / DNS"
+        echo "  ${BOLD}[ 6 ]${NC}  Battery health — cycles / capacity / wear"
+        echo "  ${BOLD}[ 7 ]${NC}  Trust this WiFi — add current SSID to guard list"
+        echo "  ${BOLD}[ q ]${NC}  Quit"
+        echo ""
+        printf "  Choose [1-7 / q]: "
+        local choice; read -r choice
+        echo ""
+        case "$choice" in
+            1) "$0" on ;;
+            2) "$0" off ;;
+            3) "$BIN/battery-save" status; "$BIN/wifi-shield" status ;;
+            4) "$BIN/wifi-shield" log ;;
+            5) "$BIN/net-secure" check ;;
+            6) "$BIN/battery-save" health ;;
+            7) "$BIN/field-guard" trust ;;
+            q|Q) echo "  Bye."; echo ""; break ;;
+            *) continue ;;
+        esac
+        printf "\n  Press Enter to return to menu..."; read -r
+    done
+}
+
 case "$1" in
     on|ON)
         banner "🌍 FIELD MODE — ON"
@@ -53,7 +96,7 @@ case "$1" in
         echo "${YELLOW}  Home settings restored.${NC}"
         echo ""
         ;;
-    status|"")
+    status)
         banner "📊 FIELD MODE — STATUS"
         "$BIN/battery-save" status
         "$BIN/wifi-shield" status
@@ -62,8 +105,11 @@ case "$1" in
         banner "👁  FIELD MODE — LOG"
         "$BIN/wifi-shield" log
         ;;
+    menu|"")
+        interactive_menu
+        ;;
     *)
-        echo "Usage: field-mode [on|off|status|log]"
+        echo "Usage: field-mode [on|off|status|log|menu]"
         exit 1
         ;;
 esac
