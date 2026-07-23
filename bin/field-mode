@@ -21,6 +21,38 @@ banner() {
 vpn_active() { route -n get default 2>/dev/null | grep -qE 'interface: utun'; }
 vpn_iface()  { route -n get default 2>/dev/null | awk '/interface:/ {print $2}'; }
 
+# ── Arm / disarm (shared by CLI + menu) ──────────────────────
+arm() {
+    banner "🌍 FIELD MODE — ON"
+    # VPN guard: on public WiFi, no VPN = exposed outbound (MITM).
+    if vpn_active; then
+        echo "${GREEN}  ✓ VPN active — outbound encrypted via $(vpn_iface)${NC}"
+    else
+        echo "${RED}${BOLD}  ⚠ NO VPN — outbound EXPOSED (MITM/evil-twin possible)${NC}"
+        echo "${YELLOW}  Turn on NymVPN first. The shield only protects inbound.${NC}"
+        echo ""
+        echo -n "  Arm anyway without VPN? [y/N] "
+        local ans; read -r ans
+        [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "${DIM}  Cancelled. Enable VPN and re-run.${NC}"; return 1; }
+    fi
+    echo "${DIM}Arming battery eco + ghost WiFi shield...${NC}"
+    "$BIN/battery-save" on
+    "$BIN/wifi-shield" on
+    banner "✅ FIELD MODE ACTIVE — $(date '+%H:%M:%S')"
+    echo "${GREEN}  Battery eco + Mac ghost. Ready for the road.${NC}"
+    echo ""
+}
+
+disarm() {
+    banner "🏠 FIELD MODE — OFF"
+    echo "${DIM}Restoring battery + normal connectivity...${NC}"
+    "$BIN/battery-save" off
+    "$BIN/wifi-shield" off
+    banner "✅ BACK TO NORMAL — $(date '+%H:%M:%S')"
+    echo "${YELLOW}  Home settings restored.${NC}"
+    echo ""
+}
+
 # ── Interactive main menu ────────────────────────────────────
 interactive_menu() {
     while true; do
@@ -47,11 +79,11 @@ interactive_menu() {
         echo "  ${BOLD}[ q ]${NC}  Quit"
         echo ""
         printf "  Choose [1-7 / q]: "
-        local choice; read -r choice
+        local choice; read -r choice || break   # EOF (Ctrl+D / piped) → exit
         echo ""
         case "$choice" in
-            1) "$0" on ;;
-            2) "$0" off ;;
+            1) arm ;;
+            2) disarm ;;
             3) "$BIN/battery-save" status; "$BIN/wifi-shield" status ;;
             4) "$BIN/wifi-shield" log ;;
             5) "$BIN/net-secure" check ;;
@@ -60,42 +92,13 @@ interactive_menu() {
             q|Q) echo "  Bye."; echo ""; break ;;
             *) continue ;;
         esac
-        printf "\n  Press Enter to return to menu..."; read -r
+        printf "\n  Press Enter to return to menu..."; read -r || break
     done
 }
 
 case "$1" in
-    on|ON)
-        banner "🌍 FIELD MODE — ON"
-
-        # VPN guard: on public WiFi, no VPN = exposed outbound (MITM).
-        if vpn_active; then
-            echo "${GREEN}  ✓ VPN active — outbound encrypted via $(vpn_iface)${NC}"
-        else
-            echo "${RED}${BOLD}  ⚠ NO VPN — outbound EXPOSED (MITM/evil-twin possible)${NC}"
-            echo "${YELLOW}  Turn on NymVPN first. The shield only protects inbound.${NC}"
-            echo ""
-            echo -n "  Arm anyway without VPN? [y/N] "
-            read -r ans
-            [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "${DIM}  Cancelled. Enable VPN and re-run.${NC}"; exit 1; }
-        fi
-
-        echo "${DIM}Arming battery eco + ghost WiFi shield...${NC}"
-        "$BIN/battery-save" on
-        "$BIN/wifi-shield" on
-        banner "✅ FIELD MODE ACTIVE — $(date '+%H:%M:%S')"
-        echo "${GREEN}  Battery eco + Mac ghost. Ready for the road.${NC}"
-        echo ""
-        ;;
-    off|OFF)
-        banner "🏠 FIELD MODE — OFF"
-        echo "${DIM}Restoring battery + normal connectivity...${NC}"
-        "$BIN/battery-save" off
-        "$BIN/wifi-shield" off
-        banner "✅ BACK TO NORMAL — $(date '+%H:%M:%S')"
-        echo "${YELLOW}  Home settings restored.${NC}"
-        echo ""
-        ;;
+    on|ON)   arm ;;
+    off|OFF) disarm ;;
     status)
         banner "📊 FIELD MODE — STATUS"
         "$BIN/battery-save" status
