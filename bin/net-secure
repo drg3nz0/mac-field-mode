@@ -1,0 +1,136 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────────
+#  net-secure — MacBook M4 Pro
+#  Encrypted DNS (DoH) toggle + disk/security posture check.
+#  Usage: net-secure [dns-on|dns-off|check|status]
+# ─────────────────────────────────────────────────────────────
+
+DOH_PROFILE="$HOME/.cloudflare-doh.mobileconfig"
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+OK="${GREEN}✓${NC}"; NO="${RED}✗${NC}"; WARN="${YELLOW}!${NC}"
+
+wifi_service() {
+    networksetup -listallhardwareports 2>/dev/null \
+        | awk '/Wi-Fi|AirPort/{getline; print $2; exit}'
+    # fallback name
+}
+wifi_name() { networksetup -listallnetworkservices 2>/dev/null | grep -iE 'wi-?fi|airport' | head -1; }
+
+# Quick DNS = point resolver at Cloudflare (plaintext, still better than ISP)
+dns_on() {
+    local svc; svc=$(wifi_name)
+    [[ -z "$svc" ]] && { echo "  ${RED}No Wi-Fi service found.${NC}"; return 1; }
+    networksetup -setdnsservers "$svc" 1.1.1.1 1.0.0.1 2606:4700:4700::1111 2606:4700:4700::1001 2>/dev/null \
+        && echo "  $OK Resolver → Cloudflare (1.1.1.1) on '$svc'"
+
+    # Real encrypted DNS = install a DoH configuration profile
+    cat > "$DOH_PROFILE" <<'PROFILE'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>DNSSettings</key>
+      <dict>
+        <key>DNSProtocol</key><string>HTTPS</string>
+        <key>ServerURL</key><string>https://cloudflare-dns.com/dns-query</string>
+      </dict>
+      <key>PayloadDescription</key><string>Cloudflare DNS over HTTPS</string>
+      <key>PayloadDisplayName</key><string>Cloudflare DoH</string>
+      <key>PayloadIdentifier</key><string>com.t4.doh.cloudflare</string>
+      <key>PayloadType</key><string>com.apple.dnsSettings.managed</string>
+      <key>PayloadUUID</key><string>7B3A1C2D-DOH0-4C11-9F00-CLOUDFLARE01</string>
+      <key>PayloadVersion</key><integer>1</integer>
+    </dict>
+  </array>
+  <key>PayloadDisplayName</key><string>Cloudflare Encrypted DNS (DoH)</string>
+  <key>PayloadIdentifier</key><string>com.t4.doh</string>
+  <key>PayloadType</key><string>Configuration</string>
+  <key>PayloadUUID</key><string>7B3A1C2D-DOH0-4C11-9F00-CLOUDFLARE00</string>
+  <key>PayloadVersion</key><integer>1</integer>
+</dict>
+</plist>
+PROFILE
+    echo "  $OK DoH profile written: $DOH_PROFILE"
+    echo "  ${DIM}Opening it — approve in System Settings → Privacy & Security → Profiles${NC}"
+    open "$DOH_PROFILE"
+    echo "  ${BOLD}After install, all DNS is encrypted (DoH) — no more ISP/WiFi snooping.${NC}"
+}
+
+dns_off() {
+    local svc; svc=$(wifi_name)
+    [[ -n "$svc" ]] && networksetup -setdnsservers "$svc" Empty 2>/dev/null \
+        && echo "  $OK Resolver → DHCP default on '$svc'"
+    echo "  ${DIM}To remove DoH: System Settings → Profiles → remove 'Cloudflare Encrypted DNS'${NC}"
+}
+
+check() {
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Security posture ━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # FileVault (disk encryption)
+    if fdesetup status 2>/dev/null | grep -q "FileVault is On"; then
+        printf "  %b FileVault (disk crypto): ${GREEN}ON${NC}\n" "$OK"
+    else
+        printf "  %b FileVault (disk crypto): ${RED}OFF${NC}  ${DIM}→ theft = data readable${NC}\n" "$NO"
+    fi
+
+    # SIP
+    if csrutil status 2>/dev/null | grep -q "enabled"; then
+        printf "  %b System Integrity Protection: ${GREEN}enabled${NC}\n" "$OK"
+    else
+        printf "  %b System Integrity Protection: ${RED}disabled${NC}\n" "$NO"
+    fi
+
+    # Firewall
+    local fw; fw=$(/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -oE 'State = [0-9]' | grep -oE '[0-9]')
+    case "$fw" in
+        1) printf "  %b Application firewall: ${GREEN}on${NC}\n" "$OK" ;;
+        2) printf "  %b Application firewall: ${GREEN}on (block-all)${NC}\n" "$OK" ;;
+        *) printf "  %b Application firewall: ${RED}off${NC}\n" "$NO" ;;
+    esac
+
+    # VPN
+    local dev; dev=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+    if [[ "$dev" == utun* ]]; then
+        printf "  %b VPN (outbound crypto): ${GREEN}on${NC} (%s)\n" "$OK" "$dev"
+    else
+        printf "  %b VPN (outbound crypto): ${RED}off${NC} (default via %s)\n" "$NO" "${dev:-?}"
+    fi
+
+    # DNS
+    local svc dns; svc=$(wifi_name); dns=$(networksetup -getdnsservers "$svc" 2>/dev/null | head -1)
+    if [[ "$dns" == 1.1.1.* || "$dns" == 1.0.0.* ]]; then
+        printf "  %b DNS resolver: ${GREEN}Cloudflare (%s)${NC} ${DIM}(DoH if profile installed)${NC}\n" "$OK" "$dns"
+    elif [[ "$dns" =~ ^[0-9] ]]; then
+        printf "  %b DNS resolver: ${BOLD}%s${NC} ${DIM}(custom)${NC}\n" "$WARN" "$dns"
+    else
+        printf "  %b DNS resolver: ${DIM}DHCP default (ISP/WiFi)${NC}\n" "$WARN"
+    fi
+
+    # SSH remote login (needs root to read; use launchd state as fallback)
+    local remote
+    remote=$(systemsetup -getremotelogin 2>/dev/null | grep -oE 'On|Off')
+    if [[ -z "$remote" ]]; then
+        launchctl print-disabled system 2>/dev/null | grep -q '"com.openssh.sshd" => true' \
+            && remote="Off" || remote="?"
+    fi
+    printf "  %b Remote login (SSH): %s\n" \
+        "$([[ "$remote" == Off ]] && echo "$OK" || echo "$WARN")" "${remote:-?}"
+
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+case "$1" in
+    dns-on)       dns_on ;;
+    dns-off)      dns_off ;;
+    check|status|"") check ;;
+    *)
+        echo "Usage: net-secure [dns-on|dns-off|check]"
+        exit 1
+        ;;
+esac

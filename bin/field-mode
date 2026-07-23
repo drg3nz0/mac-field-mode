@@ -1,0 +1,69 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────────
+#  field-mode — MacBook M4 Pro
+#  One command to arm both: battery-save + wifi-shield.
+#  Usage: field-mode [on|off|status|log]
+# ─────────────────────────────────────────────────────────────
+
+BIN="$HOME/.local/bin"
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+banner() {
+    echo ""
+    echo "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
+    printf  "${BOLD}${CYAN}║${NC}  ${BOLD}%-36s${NC}${BOLD}${CYAN}║${NC}\n" "$1"
+    echo "${BOLD}${CYAN}╚══════════════════════════════════════╝${NC}"
+}
+
+# VPN active = default route via a tunnel interface (utun).
+# Nym / WireGuard / Tailscale all exit on utunN.
+vpn_active() { route -n get default 2>/dev/null | grep -qE 'interface: utun'; }
+vpn_iface()  { route -n get default 2>/dev/null | awk '/interface:/ {print $2}'; }
+
+case "$1" in
+    on|ON)
+        banner "🌍 FIELD MODE — ON"
+
+        # VPN guard: on public WiFi, no VPN = exposed outbound (MITM).
+        if vpn_active; then
+            echo "${GREEN}  ✓ VPN active — outbound encrypted via $(vpn_iface)${NC}"
+        else
+            echo "${RED}${BOLD}  ⚠ NO VPN — outbound EXPOSED (MITM/evil-twin possible)${NC}"
+            echo "${YELLOW}  Turn on NymVPN first. The shield only protects inbound.${NC}"
+            echo ""
+            echo -n "  Arm anyway without VPN? [y/N] "
+            read -r ans
+            [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "${DIM}  Cancelled. Enable VPN and re-run.${NC}"; exit 1; }
+        fi
+
+        echo "${DIM}Arming battery eco + ghost WiFi shield...${NC}"
+        "$BIN/battery-save" on
+        "$BIN/wifi-shield" on
+        banner "✅ FIELD MODE ACTIVE — $(date '+%H:%M:%S')"
+        echo "${GREEN}  Battery eco + Mac ghost. Ready for the road.${NC}"
+        echo ""
+        ;;
+    off|OFF)
+        banner "🏠 FIELD MODE — OFF"
+        echo "${DIM}Restoring battery + normal connectivity...${NC}"
+        "$BIN/battery-save" off
+        "$BIN/wifi-shield" off
+        banner "✅ BACK TO NORMAL — $(date '+%H:%M:%S')"
+        echo "${YELLOW}  Home settings restored.${NC}"
+        echo ""
+        ;;
+    status|"")
+        banner "📊 FIELD MODE — STATUS"
+        "$BIN/battery-save" status
+        "$BIN/wifi-shield" status
+        ;;
+    log|LOG)
+        banner "👁  FIELD MODE — LOG"
+        "$BIN/wifi-shield" log
+        ;;
+    *)
+        echo "Usage: field-mode [on|off|status|log]"
+        exit 1
+        ;;
+esac

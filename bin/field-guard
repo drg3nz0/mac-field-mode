@@ -1,0 +1,130 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────────
+#  field-guard — MacBook M4 Pro
+#  Watches WiFi. On an untrusted SSID → macOS notification to arm
+#  field-mode. (Full auto-arm needs sudo → not possible from a
+#  background agent; this alerts you to run `field-mode on`.)
+#  Usage: field-guard [check|install|uninstall|status|trust|untrust|list]
+# ─────────────────────────────────────────────────────────────
+
+TRUST_FILE="$HOME/.field-trusted-ssids"
+AGENT_LABEL="com.t4.field-guard"
+AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
+SELF="$HOME/.local/bin/field-guard"
+AIRPORT_PREF="/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist"
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+cur_ssid() { ipconfig getsummary en0 2>/dev/null | awk -F' SSID : ' '/ SSID : / {print $2; exit}'; }
+is_trusted() { [[ -f "$TRUST_FILE" ]] && grep -Fxq "$1" "$TRUST_FILE"; }
+vpn_active() { route -n get default 2>/dev/null | grep -qE 'interface: utun'; }
+
+notify() { osascript -e "display notification \"$2\" with title \"$1\" sound name \"Submarine\"" &>/dev/null; }
+
+# Called by the LaunchAgent on every WiFi change
+check() {
+    local ssid; ssid=$(cur_ssid)
+    [[ -z "$ssid" ]] && exit 0            # not on WiFi
+    if is_trusted "$ssid"; then
+        exit 0                            # trusted network, stay quiet
+    fi
+    # Untrusted network
+    if vpn_active; then
+        notify "🌍 Untrusted WiFi: $ssid" "VPN is on. Run: field-mode on"
+    else
+        notify "⚠️ Untrusted WiFi: $ssid" "NO VPN. Turn on NymVPN, then field-mode on"
+    fi
+    exit 0
+}
+
+install_agent() {
+    mkdir -p "$HOME/Library/LaunchAgents"
+    cat > "$AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${SELF}</string>
+        <string>check</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>${AIRPORT_PREF}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+    launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" &>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null \
+        && echo "  ${GREEN}✓${NC} Agent installed + loaded" \
+        || echo "  ${RED}✗${NC} Load failed (try: launchctl bootstrap gui/$(id -u) $AGENT_PLIST)"
+    echo "  ${DIM}Watches WiFi changes. Alerts on untrusted SSID.${NC}"
+}
+
+uninstall_agent() {
+    launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" &>/dev/null
+    rm -f "$AGENT_PLIST"
+    echo "  ${YELLOW}✓${NC} Agent unloaded + removed"
+}
+
+status() {
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Field Guard — status ━━━━━━━━━━━━━━━${NC}"
+    local ssid; ssid=$(cur_ssid)
+    printf "  Current SSID : ${BOLD}%s${NC}\n" "${ssid:-not on WiFi}"
+    if [[ -n "$ssid" ]]; then
+        if is_trusted "$ssid"; then
+            printf "  Trusted      : ${GREEN}yes${NC}\n"
+        else
+            printf "  Trusted      : ${RED}no${NC}  ${DIM}(would alert)${NC}\n"
+        fi
+    fi
+    if launchctl list "$AGENT_LABEL" &>/dev/null; then
+        printf "  Watcher      : ${GREEN}running${NC}\n"
+    else
+        printf "  Watcher      : ${DIM}not installed${NC}  ${DIM}(field-guard install)${NC}\n"
+    fi
+    echo ""
+    echo "  ${BOLD}Trusted SSIDs:${NC}"
+    if [[ -s "$TRUST_FILE" ]]; then
+        sed 's/^/    • /' "$TRUST_FILE"
+    else
+        echo "    ${DIM}(none — add current: field-guard trust)${NC}"
+    fi
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+trust() {
+    local ssid="${1:-$(cur_ssid)}"
+    [[ -z "$ssid" ]] && { echo "  ${RED}No SSID given and not on WiFi.${NC}"; return 1; }
+    touch "$TRUST_FILE"
+    grep -Fxq "$ssid" "$TRUST_FILE" || echo "$ssid" >> "$TRUST_FILE"
+    echo "  ${GREEN}✓${NC} Trusted: ${BOLD}$ssid${NC}"
+}
+
+untrust() {
+    local ssid="${1:-$(cur_ssid)}"
+    [[ -z "$ssid" || ! -f "$TRUST_FILE" ]] && { echo "  ${RED}Nothing to remove.${NC}"; return 1; }
+    grep -Fxv "$ssid" "$TRUST_FILE" > "${TRUST_FILE}.tmp" && mv "${TRUST_FILE}.tmp" "$TRUST_FILE"
+    echo "  ${YELLOW}✓${NC} Untrusted: ${BOLD}$ssid${NC}"
+}
+
+case "$1" in
+    check)      check ;;
+    install)    install_agent ;;
+    uninstall)  uninstall_agent ;;
+    status|"")  status ;;
+    trust)      trust "$2" ;;
+    untrust)    untrust "$2" ;;
+    list)       [[ -s "$TRUST_FILE" ]] && cat "$TRUST_FILE" || echo "(none)" ;;
+    *)
+        echo "Usage: field-guard [check|install|uninstall|status|trust [ssid]|untrust [ssid]|list]"
+        exit 1
+        ;;
+esac

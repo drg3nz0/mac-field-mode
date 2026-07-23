@@ -1,0 +1,235 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────────
+#  wifi-shield — MacBook M4 Pro
+#  Ghost mode for public / untrusted WiFi.
+#  Usage: wifi-shield [on|off|status|log]
+#  All output English. State: $HOME/.wifi-shield.state
+# ─────────────────────────────────────────────────────────────
+
+STATE_FILE="$HOME/.wifi-shield.state"
+PF_ANCHOR="/etc/pf.anchors/wifi-shield"
+FW="/usr/libexec/ApplicationFirewall/socketfilterfw"
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+CHECK="${GREEN}✓${NC}"; SKIP="${DIM}○${NC}"; WARN="${YELLOW}!${NC}"
+
+# ── Helpers ──────────────────────────────────────────────────
+cur_ssid() { ipconfig getsummary en0 2>/dev/null | awk -F' SSID : ' '/ SSID : / {print $2; exit}'; }
+cur_ip()   { ipconfig getifaddr en0 2>/dev/null; }
+state_get(){ [[ -f "$STATE_FILE" ]] && grep -E "^$1 " "$STATE_FILE" | head -1 | cut -d' ' -f2-; }
+
+# Count non-loopback TCP listeners = inbound exposure surface
+listeners() {
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+        | awk 'NR>1 && $9 !~ /127\.0\.0\.1|\[::1\]/ {print $9}' | sort -u | wc -l | tr -d ' '
+}
+
+fmt_elapsed() { local s=$1 h m; h=$(( s/3600 )); m=$(( (s%3600)/60 )); printf "%dh %02dm" "$h" "$m"; }
+
+# ── Status ───────────────────────────────────────────────────
+shield_status() {
+    echo ""
+    echo "${BOLD}${CYAN}━━━ WiFi Shield — status ━━━━━━━━━━━━━━━${NC}"
+    printf "  Network  : ${BOLD}%s${NC}\n" "$(cur_ssid)"
+    printf "  IP       : ${BOLD}%s${NC}\n" "$(cur_ip)"
+
+    local fw_num stealth fw_state
+    fw_num=$($FW --getglobalstate 2>/dev/null | grep -oE 'State = [0-9]' | grep -oE '[0-9]')
+    case "$fw_num" in
+        0) fw_state="${YELLOW}off${NC}" ;;
+        1) fw_state="${GREEN}on${NC}" ;;
+        2) fw_state="${GREEN}on (block-all)${NC}" ;;
+        *) fw_state="?" ;;
+    esac
+    stealth=$($FW --getstealthmode 2>/dev/null | grep -oE ' on$| off$' | tr -d ' ')
+    printf "  Firewall : %b\n" "$fw_state"
+    printf "  Stealth  : %s\n" "${stealth:-?}"
+
+    if sudo -n pfctl -a wifi-shield -s rules 2>/dev/null | grep -q 'block'; then
+        printf "  pf block : ${GREEN}active${NC}\n"
+    else
+        printf "  pf block : ${DIM}inactive${NC}\n"
+    fi
+    printf "  Listeners: ${BOLD}%s${NC} non-loopback TCP ports\n" "$(listeners)"
+
+    # VPN (default route via tunnel)
+    local dev; dev=$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')
+    if [[ "$dev" == utun* ]]; then
+        printf "  VPN      : ${GREEN}on${NC} (%s)\n" "$dev"
+    else
+        printf "  VPN      : ${RED}off${NC} (default via %s)\n" "${dev:-?}"
+    fi
+
+    # Effective armed state = real protections, not just the state file.
+    # (firewall block-all + stealth are readable without sudo)
+    local armed=0
+    [[ "$fw_num" == "2" ]] && armed=$(( armed + 1 ))
+    [[ "$stealth" == "on" ]] && armed=$(( armed + 1 ))
+
+    echo ""
+    if [[ -f "$STATE_FILE" ]]; then
+        local epoch date_h ssid0
+        epoch=$(state_get EPOCH); date_h=$(state_get DATE); ssid0=$(state_get SSID)
+        echo "  ${BOLD}${GREEN}[ 👻 SHIELD ON — ghost mode ]${NC}"
+        [[ -n "$date_h" ]] && printf "  Since    : ${BOLD}%s${NC}\n" "$date_h"
+        [[ -n "$epoch"  ]] && printf "  Elapsed  : ${BOLD}%s${NC}\n" "$(fmt_elapsed $(( $(date +%s) - epoch )))"
+        [[ -n "$ssid0"  ]] && printf "  Armed on : ${DIM}%s${NC}\n" "$ssid0"
+    elif (( armed == 2 )); then
+        echo "  ${BOLD}${GREEN}[ 👻 SHIELD ON — protections active ]${NC}"
+        echo "  ${YELLOW}! No state file (interrupted arm). Run 'wifi-shield on' to sync,${NC}"
+        echo "  ${YELLOW}  or 'wifi-shield off' to fully stand down.${NC}"
+    elif (( armed > 0 )); then
+        echo "  ${BOLD}${YELLOW}[ PARTIAL — desync ]${NC}"
+        echo "  ${DIM}Some protections on, some off. Run 'wifi-shield on' (arm) or 'off' (clear).${NC}"
+    else
+        echo "  ${BOLD}${YELLOW}[ Shield OFF — normal connectivity ]${NC}"
+    fi
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+# ── Enable shield ────────────────────────────────────────────
+enable_shield() {
+    local exp_before; exp_before=$(listeners)
+
+    echo ""
+    echo "${BOLD}${GREEN}▶ Enabling SHIELD — ghost mode...${NC}"
+    echo ""
+
+    sudo $FW --setglobalstate on &>/dev/null   && echo "  $CHECK Firewall on"
+    sudo $FW --setblockall on &>/dev/null       && echo "  $CHECK All inbound connections blocked"
+    sudo $FW --setstealthmode on &>/dev/null    && echo "  $CHECK Stealth mode (ping/scan ignored)"
+    sudo $FW --setloggingmode on &>/dev/null
+    sudo $FW --setloggingopt detail &>/dev/null
+    echo "  $CHECK Logging on (/var/log/appfirewall.log)"
+
+    # systemsetup -setremotelogin off prompts yes/no on stdin → feed "yes" to
+    # avoid a hidden hang. Fallback: bootout the sshd daemon directly.
+    echo yes | sudo systemsetup -setremotelogin off &>/dev/null
+    sudo launchctl bootout system/com.openssh.sshd &>/dev/null
+    echo "  $CHECK SSH (remote login) off"
+    sudo launchctl bootout system/com.apple.smbd &>/dev/null
+    echo "  $CHECK File sharing (SMB) off"
+    sudo launchctl bootout system/com.apple.screensharing &>/dev/null
+    echo "  $CHECK Screen sharing (VNC) off"
+
+    sudo tee "$PF_ANCHOR" >/dev/null <<'PFRULES'
+set skip on lo0
+block in log on en0 all
+pass out on en0 all keep state
+PFRULES
+    if ! grep -q 'anchor "wifi-shield"' /etc/pf.conf 2>/dev/null; then
+        echo 'anchor "wifi-shield"' | sudo tee -a /etc/pf.conf >/dev/null
+        echo "load anchor \"wifi-shield\" from \"$PF_ANCHOR\"" | sudo tee -a /etc/pf.conf >/dev/null
+    fi
+    sudo pfctl -f /etc/pf.conf &>/dev/null
+    sudo pfctl -e &>/dev/null
+    echo "  $CHECK pf: inbound blocked (outbound + replies OK)"
+
+    defaults write com.apple.sharingd DiscoverableMode -string "Off" &>/dev/null
+    killall sharingd &>/dev/null
+    echo "  $CHECK AirDrop off (not discoverable)"
+
+    defaults write com.apple.mDNSResponder NoMulticastAdvertisements -bool true &>/dev/null
+    echo "  $CHECK Bonjour multicast advertising off"
+
+    {
+        echo "EPOCH $(date +%s)"
+        echo "DATE $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "SSID $(cur_ssid)"
+    } > "$STATE_FILE"
+
+    # Before/after exposure
+    local exp_after; exp_after=$(listeners)
+    echo ""
+    echo "  ${BOLD}${CYAN}Before → After${NC}"
+    echo "  ───────────────────────────────────────────"
+    printf "  %-22s ${DIM}%6s${NC} → ${BOLD}%6s${NC}\n" "Firewall block-all" "off" "on"
+    printf "  %-22s ${DIM}%6s${NC} → ${BOLD}%6s${NC}\n" "Stealth (invisible)" "?" "on"
+    printf "  %-22s ${DIM}%6s${NC} → ${BOLD}%6s${NC}\n" "Inbound reachable" "yes" "no"
+    printf "  %-22s ${DIM}%6s${NC} → ${BOLD}%6s${NC}   ${DIM}(now firewalled)${NC}\n" "Listening TCP ports" "$exp_before" "$exp_after"
+
+    echo ""
+    echo "${BOLD}${GREEN}👻 SHIELD ON — Mac invisible on the network${NC}"
+    echo "${DIM}   Outbound OK. No open port reachable. Ping ignored.${NC}"
+    shield_status
+}
+
+# ── Disable / restore ────────────────────────────────────────
+disable_shield() {
+    local epoch date_h
+    epoch=$(state_get EPOCH); date_h=$(state_get DATE)
+
+    echo ""
+    echo "${BOLD}${YELLOW}◀ Restoring normal connectivity...${NC}"
+    echo ""
+
+    sudo $FW --setblockall off &>/dev/null   && echo "  $CHECK Signed inbound connections re-allowed"
+    sudo $FW --setstealthmode off &>/dev/null && echo "  $CHECK Stealth mode off"
+    echo "  $WARN Firewall left ${BOLD}ON${NC} (recommended everywhere)"
+
+    sudo pfctl -a wifi-shield -F rules &>/dev/null
+    sudo pfctl -d &>/dev/null
+    echo "  $CHECK pf: inbound block unloaded"
+
+    defaults write com.apple.sharingd DiscoverableMode -string "Contacts Only" &>/dev/null
+    killall sharingd &>/dev/null
+    echo "  $CHECK AirDrop re-enabled (contacts only)"
+
+    defaults delete com.apple.mDNSResponder NoMulticastAdvertisements &>/dev/null
+    echo "  $CHECK Bonjour re-enabled"
+
+    echo "  $WARN SSH/SMB/Screen left ${BOLD}off${NC} (re-enable manually if needed)"
+
+    if [[ -n "$epoch" ]]; then
+        echo ""
+        echo "  ${BOLD}${CYAN}Shield session summary${NC}"
+        [[ -n "$date_h" ]] && printf "  Armed at : %s\n" "$date_h"
+        printf "  Duration : ${BOLD}%s${NC}\n" "$(fmt_elapsed $(( $(date +%s) - epoch )))"
+    fi
+
+    rm -f "$STATE_FILE"
+    echo ""
+    echo "${BOLD}${YELLOW}✅ Normal connectivity restored — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+    shield_status
+}
+
+# ── Show blocked attempts ────────────────────────────────────
+show_log() {
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Blocked access attempts ━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "${BOLD}App firewall — recent denied entries:${NC}"
+    if [[ -f /var/log/appfirewall.log ]]; then
+        local hits n
+        hits=$(grep -iE "Deny|blocked" /var/log/appfirewall.log 2>/dev/null | tail -20)
+        if [[ -n "$hits" ]]; then
+            echo "$hits" | sed 's/^/  /'
+            n=$(grep -icE "Deny|blocked" /var/log/appfirewall.log 2>/dev/null)
+            echo ""
+            echo "  ${DIM}Total denials logged: ${BOLD}$n${NC}"
+        else
+            echo "  ${GREEN}No denials logged.${NC} ${DIM}(good, or log is fresh)${NC}"
+        fi
+    else
+        echo "  ${DIM}No log yet — enable the shield at least once.${NC}"
+    fi
+    echo ""
+    echo "${BOLD}pf — LIVE dropped inbound packets${NC}"
+    echo "${DIM}  (each line = a dropped inbound attempt. Ctrl+C to quit)${NC}"
+    echo ""
+    sudo tcpdump -ni pflog0 2>/dev/null
+}
+
+# ── Router ───────────────────────────────────────────────────
+case "$1" in
+    on|ON)      enable_shield ;;
+    off|OFF)    disable_shield ;;
+    log|LOG)    show_log ;;
+    status|"")  shield_status ;;
+    *)
+        echo "Usage: wifi-shield [on|off|status|log]"
+        exit 1
+        ;;
+esac

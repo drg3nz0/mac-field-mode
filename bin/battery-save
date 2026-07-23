@@ -1,0 +1,480 @@
+#!/bin/zsh
+# ─────────────────────────────────────────────────────────────
+#  battery-save — MacBook M4 Pro
+#  Usage: battery-save [on|off|status|hogs|startup|menu]
+#  All output English. State: $HOME/.battery-save.state
+# ─────────────────────────────────────────────────────────────
+
+STATE_FILE="$HOME/.battery-save.state"
+
+# ANSI colors
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+CHECK="${GREEN}✓${NC}"; SKIP="${DIM}○${NC}"
+
+# ── Helpers ──────────────────────────────────────────────────
+# Instant power draw in watts (from SMC battery).
+watts_now() {
+    local raw a v
+    raw=$(ioreg -rn AppleSmartBattery 2>/dev/null)
+    a=$(echo "$raw" | grep -oE '"InstantAmperage" ?= ?-?[0-9]+' | grep -oE '\-?[0-9]+$' | head -1)
+    v=$(echo "$raw" | grep -oE '"Voltage" ?= ?[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    [[ -z "$a" || -z "$v" ]] && return
+    # 64-bit unsigned wrap → signed needs arbitrary precision (python3).
+    if command -v python3 &>/dev/null; then
+        python3 -c "a=$a; v=$v
+a = a-2**64 if a>2**63 else a
+print(f'{abs(a)/1000*v/1000:.1f}')" 2>/dev/null
+    fi
+}
+
+batt_pct()   { pmset -g batt | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
+batt_state() { pmset -g batt | grep -oE 'discharging|charging|charged' | head -1; }
+
+# seconds → "Xh Ym"
+fmt_elapsed() {
+    local s=$1 h m
+    h=$(( s / 3600 )); m=$(( (s % 3600) / 60 ))
+    printf "%dh %02dm" "$h" "$m"
+}
+
+# Read a KEY from state file
+state_get() { [[ -f "$STATE_FILE" ]] && grep -E "^$1 " "$STATE_FILE" | head -1 | cut -d' ' -f2-; }
+
+# ── Battery status & estimation ──────────────────────────────
+battery_status() {
+    local pct state time_left watts
+    pct=$(batt_pct); state=$(batt_state); watts=$(watts_now)
+    time_left=$(pmset -g batt | grep -oE '[0-9]+:[0-9]+' | head -1)
+
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Battery — M4 Pro ━━━━━━━━━━━━━━━━━━━━${NC}"
+    printf "  Level    : ${BOLD}%s%%${NC}\n" "${pct:-?}"
+    printf "  State    : %s\n" "${state:-unknown}"
+    [[ -n "$time_left" ]] && printf "  Remaining: ${BOLD}${GREEN}%s${NC} (macOS estimate)\n" "$time_left"
+    [[ -n "$watts" ]]     && printf "  Draw now : ${BOLD}%s W${NC}\n" "$watts"
+
+    # Runtime projection
+    if [[ "$state" == "discharging" && -n "$pct" ]]; then
+        local batt_wh=94.6 watts_eco=8 watts_normal=15 remaining_wh
+        remaining_wh=$(awk -v p="$pct" -v w="$batt_wh" 'BEGIN{printf "%.1f", p*w/100}')
+        echo ""
+        echo "  Runtime estimate:"
+        local -a rows=("Eco (mode ON):$watts_eco" "Normal (mode OFF):$watts_normal")
+        local row label wt h m
+        for row in "${rows[@]}"; do
+            label=${row%%:*}; wt=${row##*:}
+            h=$(awk -v r="$remaining_wh" -v w="$wt" 'BEGIN{printf "%d", r/w}')
+            m=$(awk -v r="$remaining_wh" -v w="$wt" 'BEGIN{printf "%d", (r/w - int(r/w))*60}')
+            printf "  → %-20s ${BOLD}${GREEN}~%sh %02dmin${NC}\n" "$label" "$h" "$m"
+        done
+    fi
+
+    # Active mode + start time + since-activation delta
+    if [[ -f "$STATE_FILE" ]]; then
+        local epoch date_h pct0 watts0 now elapsed
+        epoch=$(state_get EPOCH); date_h=$(state_get DATE)
+        pct0=$(state_get PCT);    watts0=$(state_get WATTS)
+        now=$(date +%s)
+        echo ""
+        echo "  ${BOLD}${GREEN}[ Eco mode: ON ]${NC}"
+        [[ -n "$date_h" ]]  && printf "  Since    : ${BOLD}%s${NC}\n" "$date_h"
+        if [[ -n "$epoch" ]]; then
+            elapsed=$(( now - epoch ))
+            printf "  Elapsed  : ${BOLD}%s${NC}\n" "$(fmt_elapsed $elapsed)"
+            if [[ -n "$pct0" && -n "$pct" && "$state" == "discharging" ]]; then
+                local used rate
+                used=$(( pct0 - pct ))
+                rate=$(awk -v u="$used" -v s="$elapsed" 'BEGIN{ if(s>0) printf "%.1f", u*3600/s; else print "0" }')
+                printf "  Used     : ${BOLD}%s%%${NC} in %s  (${BOLD}%s%%/h${NC})\n" "$used" "$(fmt_elapsed $elapsed)" "$rate"
+            fi
+            [[ -n "$watts0" && -n "$watts" ]] && \
+                printf "  Draw     : ${DIM}at ON %s W${NC} → ${BOLD}now %s W${NC}\n" "$watts0" "$watts"
+        fi
+    else
+        echo ""
+        echo "  ${DIM}[ Eco mode: off ]${NC}"
+    fi
+
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+# ── Before/after comparison table ────────────────────────────
+compare_table() {
+    local w0=$1 w1=$2   # watts before / after
+    [[ -z "$w0" || -z "$w1" ]] && return
+    local batt_wh=94.6 pct diff h0 m0 h1 m1
+    pct=$(batt_pct)
+    local rem_wh
+    rem_wh=$(awk -v p="$pct" -v w="$batt_wh" 'BEGIN{printf "%.1f", p*w/100}')
+    h0=$(awk -v r="$rem_wh" -v w="$w0" 'BEGIN{ if(w>0) printf "%d", r/w; else print 0}')
+    m0=$(awk -v r="$rem_wh" -v w="$w0" 'BEGIN{ if(w>0) printf "%d",(r/w-int(r/w))*60; else print 0}')
+    h1=$(awk -v r="$rem_wh" -v w="$w1" 'BEGIN{ if(w>0) printf "%d", r/w; else print 0}')
+    m1=$(awk -v r="$rem_wh" -v w="$w1" 'BEGIN{ if(w>0) printf "%d",(r/w-int(r/w))*60; else print 0}')
+    diff=$(awk -v a="$w0" -v b="$w1" 'BEGIN{printf "%+.1f", b-a}')
+    local pctcut
+    pctcut=$(awk -v a="$w0" -v b="$w1" 'BEGIN{ if(a>0) printf "%.0f", (a-b)/a*100; else print 0}')
+
+    echo ""
+    echo "  ${BOLD}${CYAN}Before → After${NC}"
+    echo "  ───────────────────────────────────────────"
+    printf "  %-14s ${DIM}%8s${NC}   ${BOLD}%8s${NC}   %s\n" "" "BEFORE" "AFTER" "Δ"
+    printf "  %-14s ${DIM}%6s W${NC}   ${BOLD}%6s W${NC}   ${GREEN}%s W${NC}\n" "Power draw" "$w0" "$w1" "$diff"
+    printf "  %-14s ${DIM}~%dh%02dm${NC}   ${BOLD}~%dh%02dm${NC}\n" "Runtime" "$h0" "$m0" "$h1" "$m1"
+    [[ "$pctcut" -gt 0 ]] 2>/dev/null && \
+        echo "  ${GREEN}${BOLD}→ ~${pctcut}% less power draw${NC}"
+    echo "  ${DIM}(draw settles a few sec after enabling)${NC}"
+}
+
+# ── Enable eco mode ──────────────────────────────────────────
+enable_save() {
+    local w_before pct_before
+    w_before=$(watts_now); pct_before=$(batt_pct)
+
+    echo ""
+    echo "${BOLD}${GREEN}▶ Enabling battery eco mode...${NC}"
+    echo ""
+
+    sudo pmset -b lowpowermode 1 2>/dev/null \
+        && echo "  $CHECK Low Power Mode on (CPU/GPU throttled)" \
+        || echo "  $SKIP Low Power Mode (sudo required)"
+
+    sudo pmset -b displaysleep 3 halfdim 1 2>/dev/null
+    echo "  $CHECK Display sleep: 3 min"
+
+    defaults write com.apple.CoreDisplay "denyRequestsDueToHDRMode" -bool true 2>/dev/null
+    echo "  $CHECK ProMotion off (fixed 60Hz)"
+
+    sudo pmset -b powernap 0 2>/dev/null
+    echo "  $CHECK PowerNap off"
+
+    sudo pmset -b womp 0 tcpkeepalive 0 networkoversleep 0 2>/dev/null
+    echo "  $CHECK Wake-on-network off"
+
+    sudo mdutil -a -i off &>/dev/null
+    echo "  $CHECK Spotlight indexing paused"
+
+    sudo tmutil stopbackup &>/dev/null
+    sudo tmutil disable &>/dev/null
+    echo "  $CHECK Time Machine paused"
+
+    sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate \
+        AutomaticCheckEnabled -bool false &>/dev/null
+    echo "  $CHECK Auto update checks off"
+
+    if command -v blueutil &>/dev/null; then
+        blueutil --power 0 && echo "  $CHECK Bluetooth off"
+    else
+        echo "  $SKIP Bluetooth: brew install blueutil to auto-toggle"
+    fi
+
+    if command -v brightness &>/dev/null; then
+        brightness 0.35 && echo "  $CHECK Brightness → 35%"
+    else
+        echo "  $SKIP Brightness: brew install brightness to auto-dim"
+        for i in {1..5}; do
+            osascript -e 'tell application "System Events" to key code 107' &>/dev/null
+        done
+    fi
+
+    defaults write com.apple.Safari \
+        "com.apple.Safari.ContentPageGroupIdentifier.WebKit2UseGPUProcessForMedia" \
+        -bool false 2>/dev/null
+    defaults write com.apple.Safari WebKitPreferences.mediaCapabilitiesEnabled \
+        -bool false 2>/dev/null
+    echo "  $CHECK Safari GPU media use reduced"
+
+    for app in "Photos" "Backup and Sync" "Dropbox" "OneDrive" "Google Drive"; do
+        pgrep -x "$app" &>/dev/null && killall -STOP "$app" &>/dev/null
+    done
+    echo "  $CHECK Cloud/photo apps suspended (if running)"
+
+    # Save state with start time + baseline snapshot
+    {
+        echo "EPOCH $(date +%s)"
+        echo "DATE $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "PCT ${pct_before:-}"
+        echo "WATTS ${w_before:-}"
+    } > "$STATE_FILE"
+
+    echo ""
+    echo "${BOLD}${GREEN}✅ Eco mode enabled — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+
+    local w_after
+    w_after=$(watts_now)
+    compare_table "$w_before" "$w_after"
+    battery_status
+}
+
+# ── Disable / restore ────────────────────────────────────────
+disable_save() {
+    # Session summary before wiping state
+    local epoch pct0 elapsed used
+    epoch=$(state_get EPOCH); pct0=$(state_get PCT)
+
+    echo ""
+    echo "${BOLD}${YELLOW}◀ Restoring normal settings...${NC}"
+    echo ""
+
+    sudo pmset -b lowpowermode 0 2>/dev/null
+    echo "  $CHECK Low Power Mode off"
+    sudo pmset -b displaysleep 10 halfdim 1 2>/dev/null
+    echo "  $CHECK Display sleep → 10 min"
+    defaults delete com.apple.CoreDisplay "denyRequestsDueToHDRMode" 2>/dev/null
+    echo "  $CHECK ProMotion on (adaptive)"
+    sudo pmset -b powernap 1 2>/dev/null
+    echo "  $CHECK PowerNap on"
+    sudo pmset -b womp 1 tcpkeepalive 1 networkoversleep 0 2>/dev/null
+    echo "  $CHECK Wake-on-network on"
+    sudo mdutil -a -i on &>/dev/null
+    echo "  $CHECK Spotlight on"
+    sudo tmutil enable &>/dev/null
+    echo "  $CHECK Time Machine on"
+    sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate \
+        AutomaticCheckEnabled -bool true &>/dev/null
+    echo "  $CHECK Auto update checks on"
+    command -v blueutil &>/dev/null && blueutil --power 1 && echo "  $CHECK Bluetooth on"
+    command -v brightness &>/dev/null && brightness 0.70 && echo "  $CHECK Brightness → 70%"
+
+    for app in "Photos" "Backup and Sync" "Dropbox" "OneDrive" "Google Drive"; do
+        pgrep -x "$app" &>/dev/null && killall -CONT "$app" &>/dev/null
+    done
+    echo "  $CHECK Cloud/photo apps resumed"
+
+    defaults delete com.apple.Safari \
+        "com.apple.Safari.ContentPageGroupIdentifier.WebKit2UseGPUProcessForMedia" 2>/dev/null
+    defaults delete com.apple.Safari WebKitPreferences.mediaCapabilitiesEnabled 2>/dev/null
+    echo "  $CHECK Safari settings restored"
+
+    # Session summary
+    if [[ -n "$epoch" ]]; then
+        elapsed=$(( $(date +%s) - epoch ))
+        local pct_now=$(batt_pct)
+        echo ""
+        echo "  ${BOLD}${CYAN}Eco session summary${NC}"
+        printf "  Duration : ${BOLD}%s${NC}\n" "$(fmt_elapsed $elapsed)"
+        if [[ -n "$pct0" && -n "$pct_now" ]]; then
+            used=$(( pct0 - pct_now ))
+            local rate=$(awk -v u="$used" -v s="$elapsed" 'BEGIN{ if(s>0) printf "%.1f", u*3600/s; else print 0}')
+            printf "  Battery  : ${BOLD}%s%%${NC} → ${BOLD}%s%%${NC}  (used %s%%, %s%%/h)\n" "$pct0" "$pct_now" "$used" "$rate"
+        fi
+    fi
+
+    rm -f "$STATE_FILE"
+    echo ""
+    echo "${BOLD}${YELLOW}✅ Normal settings restored — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
+    battery_status
+}
+
+# ── Startup / login items audit ──────────────────────────────
+startup_audit() {
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Startup audit ━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    echo ""
+    echo "  ${BOLD}LaunchAgents (~/Library/LaunchAgents/)${NC}"
+    local la_dir="$HOME/Library/LaunchAgents"
+    if [[ -d "$la_dir" ]]; then
+        for plist in "$la_dir"/*.plist; do
+            [[ -f "$plist" ]] || continue
+            local label prog loaded
+            label=$(defaults read "${plist%.plist}" Label 2>/dev/null || basename "$plist" .plist)
+            prog=$(defaults read "${plist%.plist}" ProgramArguments 2>/dev/null | head -1 | tr -d '(),"' | xargs basename 2>/dev/null || echo "?")
+            launchctl list "$label" &>/dev/null && loaded="${GREEN}● loaded${NC}" || loaded="${DIM}○ inactive${NC}"
+            printf "  %b  %-40s ${DIM}%s${NC}\n" "$loaded" "$label" "$prog"
+        done
+    else
+        echo "  ${DIM}(none)${NC}"
+    fi
+
+    echo ""
+    echo "  ${BOLD}Login Items (System Settings → General)${NC}"
+    local login_items
+    login_items=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null)
+    if [[ -n "$login_items" ]]; then
+        echo "$login_items" | tr ',' '\n' | while read -r item; do
+            item=$(echo "$item" | xargs)
+            [[ -n "$item" ]] && printf "  ${YELLOW}▸${NC}  %s\n" "$item"
+        done
+    else
+        echo "  ${DIM}(none or permission denied)${NC}"
+    fi
+
+    echo ""
+    echo "  ${BOLD}Background process battery impact${NC}"
+    ps -Ao pid,pcpu,pmem,comm -r 2>/dev/null | awk 'NR>1 && $2+0 > 1.0 {
+        sub(".*/","",$4); printf "  ⚡ %-28s CPU: %5.1f%%  MEM: %4.1f%%\n", $4, $2, $3
+    }' | head -10
+
+    echo ""
+    echo "  ${BOLD}Sleep blockers (pmset assertions)${NC}"
+    pmset -g assertions 2>/dev/null | grep -E "PreventUser|PreventSystem|NoIdleSleep" | grep -v "0x0\b" | while read -r line; do
+        echo "  ${YELLOW}⚠${NC}  $line"
+    done || echo "  ${GREEN}✓ No active sleep blockers${NC}"
+
+    echo ""
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+# ── Energy hogs ──────────────────────────────────────────────
+energy_hogs() {
+    local threshold=8
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Energy hogs ━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    local result
+    result=$(ps -Ao pcpu,pmem,comm -r 2>/dev/null | awk -v thr="$threshold" '
+        NR == 1 { next }
+        { cpu=$1+0; mem=$2; cmd=$3; sub(".*/","",cmd); gsub(/\.app$/,"",cmd)
+          if (length(cmd)>26) cmd=substr(cmd,1,26)
+          if (cpu>=thr) printf "%.1f\t%.1f\t%s\n", cpu, mem, cmd }' | head -10)
+
+    if [[ -z "$result" ]]; then
+        echo "  ${GREEN}✓ All quiet — no process > ${threshold}% CPU${NC}"
+    else
+        printf "  ${YELLOW}%-28s %6s  %6s${NC}\n" "Process" "CPU%" "Mem%"
+        echo "  ─────────────────────────────────────────"
+        while IFS=$'\t' read -r cpu mem cmd; do
+            local cpu_int=${cpu%%.*} color="$YELLOW"
+            [[ "$cpu_int" =~ ^[0-9]+$ ]] && (( cpu_int >= 50 )) && color="$RED"
+            printf "  ⚡ %-26s ${BOLD}${color}%5.1f%%${NC}  %4.1f%%\n" "$cmd" "$cpu" "$mem"
+        done <<< "$result"
+        echo ""
+        echo "  ${DIM}→ battery-save on  to throttle consumption${NC}"
+    fi
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+# ── Battery health ───────────────────────────────────────────
+battery_health() {
+    local raw cycles design rawmax
+    raw=$(ioreg -rn AppleSmartBattery 2>/dev/null)
+    cycles=$(echo "$raw" | grep -oE '"CycleCount" ?= ?[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    design=$(echo "$raw" | grep -oE '"DesignCapacity" ?= ?[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    rawmax=$(echo "$raw" | grep -oE '"AppleRawMaxCapacity" ?= ?[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    local condition
+    condition=$(system_profiler SPPowerDataType 2>/dev/null | awk -F': ' '/Condition/{print $2; exit}')
+
+    echo ""
+    echo "${BOLD}${CYAN}━━━ Battery health ━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    [[ -n "$cycles" ]]    && printf "  Cycle count   : ${BOLD}%s${NC}\n" "$cycles"
+    [[ -n "$condition" ]] && printf "  Condition     : ${BOLD}%s${NC}\n" "$condition"
+    if [[ -n "$design" && -n "$rawmax" && "$design" -gt 0 ]]; then
+        local health
+        health=$(awk -v m="$rawmax" -v d="$design" 'BEGIN{printf "%.1f", m/d*100}')
+        printf "  Full capacity : ${BOLD}%s mAh${NC} / %s mAh design\n" "$rawmax" "$design"
+        local color="$GREEN"
+        awk -v h="$health" 'BEGIN{exit !(h<80)}' && color="$YELLOW"
+        printf "  Health        : ${BOLD}${color}%s%%${NC}\n" "$health"
+    fi
+    echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+}
+
+# ── Live watch (watts / drain, refresh 5s) ───────────────────
+battery_watch() {
+    echo "${DIM}Live battery watch — Ctrl+C to quit${NC}"
+    local pct_prev="" t_prev=""
+    while true; do
+        local pct state watts now rate=""
+        pct=$(batt_pct); state=$(batt_state); watts=$(watts_now); now=$(date +%s)
+        if [[ -n "$pct_prev" && -n "$t_prev" && "$pct_prev" != "$pct" ]]; then
+            rate=$(awk -v dp=$((pct_prev - pct)) -v dt=$((now - t_prev)) 'BEGIN{ if(dt>0) printf "%.1f%%/h", dp*3600/dt }')
+            pct_prev=$pct; t_prev=$now
+        elif [[ -z "$pct_prev" ]]; then
+            pct_prev=$pct; t_prev=$now
+        fi
+        printf "\r  ${BOLD}%s%%${NC} %-11s  ${BOLD}%s W${NC}   drain: ${GREEN}%-8s${NC}  ${DIM}%s${NC}   " \
+            "${pct:-?}" "$state" "${watts:-?}" "${rate:-…}" "$(date '+%H:%M:%S')"
+        sleep 5
+    done
+}
+
+# ── Disable a login item / LaunchAgent ───────────────────────
+startup_off() {
+    local name="$1"
+    [[ -z "$name" ]] && { echo "  ${RED}Usage: battery-save startup-off <name>${NC}"; return 1; }
+    # Try login item first
+    if osascript -e "tell application \"System Events\" to delete login item \"$name\"" &>/dev/null; then
+        echo "  ${GREEN}✓${NC} Removed login item: ${BOLD}$name${NC}"
+        return 0
+    fi
+    # Try user LaunchAgent by label
+    if launchctl list "$name" &>/dev/null; then
+        launchctl bootout "gui/$(id -u)/$name" &>/dev/null \
+            && echo "  ${GREEN}✓${NC} Unloaded LaunchAgent: ${BOLD}$name${NC}" \
+            && echo "  ${DIM}(re-loads at next login unless plist removed/disabled)${NC}" \
+            && return 0
+    fi
+    echo "  ${YELLOW}!${NC} Not found as login item or loaded agent: ${BOLD}$name${NC}"
+    echo "  ${DIM}Run 'battery-save startup' to see exact names.${NC}"
+    return 1
+}
+
+# ── Interactive menu ─────────────────────────────────────────
+interactive_menu() {
+    while true; do
+        clear
+        local mode_line
+        if [[ -f "$STATE_FILE" ]]; then
+            mode_line="  ${BOLD}${GREEN}[ Eco mode: ON ]${NC}  ${DIM}since $(state_get DATE)${NC}"
+        else
+            mode_line="  ${DIM}[ Eco mode: off ]${NC}"
+        fi
+        local pct=$(batt_pct) state=$(batt_state)
+        echo ""
+        echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        printf "  ${BOLD}battery-save${NC}   %s%%  %s\n" "${pct:-?}" "${state:-}"
+        echo "$mode_line"
+        echo "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo "  ${BOLD}[ 1 ]${NC}  Status       — Battery level + runtime estimate"
+        echo "  ${BOLD}[ 2 ]${NC}  Eco ON       — Enable max battery saving"
+        echo "  ${BOLD}[ 3 ]${NC}  Eco OFF      — Restore normal settings"
+        echo "  ${BOLD}[ 4 ]${NC}  Energy hogs  — Show CPU-hungry processes"
+        echo "  ${BOLD}[ 5 ]${NC}  Startup      — Audit login items + battery impact"
+        echo "  ${BOLD}[ q ]${NC}  Quit"
+        echo ""
+        printf "  Choose [1-5 / q]: "
+        local choice; read -r choice
+        case "$choice" in
+            1) battery_status; printf "\n  Press Enter to continue..."; read -r ;;
+            2) enable_save;    printf "\n  Press Enter to continue..."; read -r ;;
+            3) disable_save;   printf "\n  Press Enter to continue..."; read -r ;;
+            4) energy_hogs;    printf "\n  Press Enter to continue..."; read -r ;;
+            5) startup_audit;  printf "\n  Press Enter to continue..."; read -r ;;
+            q|Q) echo ""; break ;;
+            *) ;;
+        esac
+    done
+}
+
+# ── Main ─────────────────────────────────────────────────────
+case "${1:-menu}" in
+    on)          enable_save ;;
+    off)         disable_save ;;
+    status)      battery_status ;;
+    hogs)        energy_hogs ;;
+    startup)     startup_audit ;;
+    startup-off) startup_off "$2" ;;
+    health)      battery_health ;;
+    watch)       battery_watch ;;
+    menu)        interactive_menu ;;
+    *)
+        echo ""
+        echo "${BOLD}Usage:${NC}  battery-save [on|off|status|hogs|startup|startup-off|health|watch|menu]"
+        echo ""
+        echo "  ${BOLD}on${NC}           Enable max battery saving"
+        echo "  ${BOLD}off${NC}          Restore normal settings"
+        echo "  ${BOLD}status${NC}       Battery level + runtime estimate"
+        echo "  ${BOLD}hogs${NC}         Show CPU-hungry processes"
+        echo "  ${BOLD}startup${NC}      Audit login items + battery impact"
+        echo "  ${BOLD}startup-off${NC}  <name>  Disable a login item / LaunchAgent"
+        echo "  ${BOLD}health${NC}       Battery cycles + capacity + wear"
+        echo "  ${BOLD}watch${NC}        Live watts/drain (refresh 5s)"
+        echo "  ${BOLD}menu${NC}         Interactive menu (default)"
+        echo ""
+        ;;
+esac
